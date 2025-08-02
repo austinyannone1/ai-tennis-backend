@@ -6,6 +6,10 @@ import os
 
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 def analyze_forehand(video_path: str) -> dict:
     # This is dummy output for now — we'll replace with real model later
     return {
