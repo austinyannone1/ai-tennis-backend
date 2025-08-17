@@ -81,3 +81,16 @@ async def analyze_video(
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# CORS — add your Bolt preview origin if you have it; "*" is okay for MVP
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["https://your-bolt-preview-domain"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
