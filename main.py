@@ -1,15 +1,28 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import uuid
 import os
 
+# Initialize FastAPI once
 app = FastAPI()
 
+# CORS — allow your Bolt preview + production frontend; "*" is okay for now
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace with ["https://your-bolt-preview-domain"] later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Health check
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+# Analysis functions
 def analyze_forehand(video_path: str) -> dict:
     return {
         "phases": [
@@ -57,6 +70,7 @@ def analyze_serve(video_path: str) -> dict:
         ]
     }
 
+# Upload + analyze endpoint
 @app.post("/analyze")
 async def analyze_video(
     file: UploadFile = File(...),
@@ -81,16 +95,3 @@ async def analyze_video(
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-# CORS — add your Bolt preview origin if you have it; "*" is okay for MVP
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # or ["https://your-bolt-preview-domain"]
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
