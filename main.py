@@ -1,4 +1,5 @@
 # main.py
+from utils_features import compute_features_from_keypoints
 import os
 import uuid
 import shutil
@@ -210,4 +211,71 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
             }).eq("id", payload.video_id).execute()
         except Exception:
             pass
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    
+# ---------- Feature computation from keypoints (MVP test endpoint) ----------
+from typing import List, Dict, Any, Optional as _Optional
+from pydantic import BaseModel, Field
+
+class KP(BaseModel):
+    """One 2D keypoint in a frame."""
+    x: float
+    y: float
+    confidence: _Optional[float] = Field(default=None)
+
+class FrameKeypoints(BaseModel):
+    """
+    One frame of pose keypoints.
+    Keys must match the names your utils_features expects (e.g., 'left_shoulder', 'right_hip', etc.)
+    """
+    # Example minimal set; extra keys are fine.
+    left_shoulder: KP
+    right_shoulder: KP
+    left_elbow: KP
+    right_elbow: KP
+    left_wrist: KP
+    right_wrist: KP
+    left_hip: KP
+    right_hip: KP
+
+class FeatureRequest(BaseModel):
+    """
+    Request body:
+    {
+      "fps": 30,
+      "stroke_type": "forehand",
+      "frames": [ { <FrameKeypoints> }, { ... } ]
+    }
+    """
+    fps: int = 30
+    stroke_type: str = "forehand"
+    frames: List[Dict[str, Dict[str, float]]]
+
+@app.post("/features/compute")
+def compute_features_endpoint(req: FeatureRequest):
+    """
+    Accepts a list of frames with named keypoints and returns the computed metrics.
+    This uses utils_features.compute_features_from_keypoints().
+    """
+    try:
+        # Convert dicts into the shape utils_features expects: list of dict[str, tuple(x,y)]
+        frames_xy = []
+        for f in req.frames:
+            frame_xy = {}
+            for name, kp in f.items():
+                # kp may be a dict already; extract x,y
+                x = kp.get("x")
+                y = kp.get("y")
+                if x is None or y is None:
+                    continue
+                frame_xy[name] = (float(x), float(y))
+            if frame_xy:
+                frames_xy.append(frame_xy)
+
+        if not frames_xy:
+            return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
+
+        feats = compute_features_from_keypoints(frames_xy, fps=req.fps, stroke_type=req.stroke_type)
+        return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
+    except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
