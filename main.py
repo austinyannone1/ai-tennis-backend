@@ -279,3 +279,62 @@ def compute_features_endpoint(req: FeatureRequest):
         return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+    
+    # --- Feature request models + endpoint ---
+
+from typing import Dict, List, Optional  # (top-level import is fine)
+from pydantic import BaseModel
+
+# Minimal keypoint schema: { x, y }
+class Keypoint(BaseModel):
+    x: float
+    y: float
+
+# Each frame is a dict of keypoint-name -> {x,y}
+# We'll accept any subset; missing points are just ignored.
+Frame = Dict[str, Keypoint]
+
+class FeatureRequest(BaseModel):
+    fps: float
+    stroke_type: str
+    frames: List[Frame]
+
+@app.post("/features/compute")
+def compute_features_endpoint(req: FeatureRequest):
+    """
+    Accepts a list of frames where each frame is a dict of
+    keypoint_name -> {x, y}. Computes the features and returns them.
+    """
+    try:
+        # Convert incoming dicts into the shape utils_features expects:
+        # List[ Dict[str, Tuple[float,float]] ]
+        frames_xy: List[Dict[str, tuple]] = []
+        for f in req.frames:
+            frame_xy: Dict[str, tuple] = {}
+            for name, kp in f.items():
+                # kp is already Keypoint; just coerce to tuple
+                if kp is None:
+                    continue
+                x, y = kp.x, kp.y
+                if x is None or y is None:
+                    continue
+                frame_xy[name] = (float(x), float(y))
+            if frame_xy:
+                frames_xy.append(frame_xy)
+
+        if not frames_xy:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No valid frames with (x,y) provided"}
+            )
+
+        feats = compute_features_from_keypoints(
+            frames_xy,
+            fps=req.fps,
+            stroke_type=req.stroke_type
+        )
+        return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
