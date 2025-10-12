@@ -4,7 +4,7 @@ import os
 import uuid
 import shutil
 import threading
-from typing import Optional
+from typing import Optional, List, Dict
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -157,7 +157,7 @@ def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
 
         # Write result & set status completed
         supabase_admin.table("videos").update({
-            "analysis": result,           # <-- change to "analysis_json" if your column is named that
+            "analysis": result,           # change to "analysis_json" if your column is named that
             "analysis_status": "completed",
             "error_message": None,
         }).eq("id", video_id).execute()
@@ -179,9 +179,6 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
       1) Upload to Supabase Storage (bucket: videos)
       2) Insert row in public.videos with analysis_status='pending'
       3) Call POST /analyze-from-storage with { video_id, storage_path, stroke_type }
-
-    This endpoint immediately sets status to 'processing', spawns a background
-    thread, and returns 202-style acceptance so the app can show "Analyzing…".
     """
     if not supabase_admin:
         return JSONResponse(status_code=500, content={"error": "Supabase admin client not configured"})
@@ -212,92 +209,20 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
         except Exception:
             pass
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
+
 # ---------- Feature computation from keypoints (MVP test endpoint) ----------
-from typing import List, Dict, Any, Optional as _Optional
-from pydantic import BaseModel, Field
-
-class KP(BaseModel):
-    """One 2D keypoint in a frame."""
-    x: float
-    y: float
-    confidence: _Optional[float] = Field(default=None)
-
-class FrameKeypoints(BaseModel):
-    """
-    One frame of pose keypoints.
-    Keys must match the names your utils_features expects (e.g., 'left_shoulder', 'right_hip', etc.)
-    """
-    # Example minimal set; extra keys are fine.
-    left_shoulder: KP
-    right_shoulder: KP
-    left_elbow: KP
-    right_elbow: KP
-    left_wrist: KP
-    right_wrist: KP
-    left_hip: KP
-    right_hip: KP
-
 class FeatureRequest(BaseModel):
     """
     Request body:
     {
       "fps": 30,
       "stroke_type": "forehand",
-      "frames": [ { <FrameKeypoints> }, { ... } ]
+      "frames": [ { keypoint_name: { "x": <float>, "y": <float> }, ... }, ... ]
     }
     """
-    fps: int = 30
+    fps: float = 30.0
     stroke_type: str = "forehand"
     frames: List[Dict[str, Dict[str, float]]]
-
-@app.post("/features/compute")
-def compute_features_endpoint(req: FeatureRequest):
-    """
-    Accepts a list of frames with named keypoints and returns the computed metrics.
-    This uses utils_features.compute_features_from_keypoints().
-    """
-    try:
-        # Convert dicts into the shape utils_features expects: list of dict[str, tuple(x,y)]
-        frames_xy = []
-        for f in req.frames:
-            frame_xy = {}
-            for name, kp in f.items():
-                # kp may be a dict already; extract x,y
-                x = kp.get("x")
-                y = kp.get("y")
-                if x is None or y is None:
-                    continue
-                frame_xy[name] = (float(x), float(y))
-            if frame_xy:
-                frames_xy.append(frame_xy)
-
-        if not frames_xy:
-            return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
-
-        feats = compute_features_from_keypoints(frames_xy, fps=req.fps, stroke_type=req.stroke_type)
-        return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    
-    # --- Feature request models + endpoint ---
-
-from typing import Dict, List, Optional  # (top-level import is fine)
-from pydantic import BaseModel
-
-# Minimal keypoint schema: { x, y }
-class Keypoint(BaseModel):
-    x: float
-    y: float
-
-# Each frame is a dict of keypoint-name -> {x,y}
-# We'll accept any subset; missing points are just ignored.
-Frame = Dict[str, Keypoint]
-
-class FeatureRequest(BaseModel):
-    fps: float
-    stroke_type: str
-    frames: List[Frame]
 
 @app.post("/features/compute")
 def compute_features_endpoint(req: FeatureRequest):
@@ -312,10 +237,8 @@ def compute_features_endpoint(req: FeatureRequest):
         for f in req.frames:
             frame_xy: Dict[str, tuple] = {}
             for name, kp in f.items():
-                # kp is already Keypoint; just coerce to tuple
-                if kp is None:
-                    continue
-                x, y = kp.x, kp.y
+                x = kp.get("x")
+                y = kp.get("y")
                 if x is None or y is None:
                     continue
                 frame_xy[name] = (float(x), float(y))
@@ -323,18 +246,12 @@ def compute_features_endpoint(req: FeatureRequest):
                 frames_xy.append(frame_xy)
 
         if not frames_xy:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No valid frames with (x,y) provided"}
-            )
+            return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
 
-        feats = compute_features_from_keypoints(
-            frames_xy,
-            fps=req.fps,
-            stroke_type=req.stroke_type
-        )
+        # ✅ Call without stroke_type — your util doesn't accept it
+        feats = compute_features_from_keypoints(frames_xy, fps=req.fps)
+
         return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
