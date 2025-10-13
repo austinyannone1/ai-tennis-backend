@@ -1,23 +1,27 @@
 # main.py
-from utils_features import compute_features_from_keypoints
 import os
 import uuid
 import shutil
 import threading
-from typing import Optional, List, Dict, Any
+import traceback
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Supabase admin client (service role)
 from supabase import create_client, Client
 
-# ---------------- App & CORS ----------------
+# Your feature helper
+from utils_features import compute_features_from_keypoints
+
+# -----------------------------------------------------------------------------
+# App & CORS
+# -----------------------------------------------------------------------------
 app = FastAPI()
 
-# For MVP it's fine to allow all; later, restrict to your app domains
+# MVP: open CORS (tighten later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,12 +30,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------- Health ----------------
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ---------------- Mock analyzers (swap with real model later) ----------------
+# -----------------------------------------------------------------------------
+# Mock analyzers (placeholder — swap with real model)
+# -----------------------------------------------------------------------------
 def analyze_forehand(video_path_or_ref: str) -> dict:
     return {
         "phases": [
@@ -79,16 +87,14 @@ def analyze_serve(video_path_or_ref: str) -> dict:
         ],
     }
 
-# ---------------- Existing /analyze (direct file upload) ----------------
+# -----------------------------------------------------------------------------
+# Existing /analyze (direct file upload — returns phases/feedback)
+# -----------------------------------------------------------------------------
 @app.post("/analyze")
 async def analyze_video(
     file: UploadFile = File(...),
     stroke_type: str = Form(...)
 ):
-    """
-    Keeps your original behavior for direct file uploads from the app.
-    Saves to a temp file, runs the mock analyzer, returns JSON.
-    """
     try:
         temp_filename = f"upload_{uuid.uuid4()}.mp4"
         with open(temp_filename, "wb") as buffer:
@@ -104,7 +110,6 @@ async def analyze_video(
         else:
             result = {"error": f"Unsupported stroke type: {stroke_type}"}
 
-        # Try to clean temp file; ignore if already gone
         try:
             os.remove(temp_filename)
         except Exception:
@@ -115,9 +120,11 @@ async def analyze_video(
         return JSONResponse(content=result)
 
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
-# ---------------- New analyze-from-storage (async background) ----------------
+# -----------------------------------------------------------------------------
+# New analyze-from-storage (async → updates Supabase row)
+# -----------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
@@ -134,14 +141,7 @@ class AnalyzeFromStoragePayload(BaseModel):
     stroke_type: str    # "forehand" | "backhand" | "serve"
 
 def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
-    """
-    Runs in a background thread:
-    - (Optional) Download the file if your real model needs local path
-    - Run analyzer
-    - Update public.videos with analysis JSON + status
-    """
     if not supabase_admin:
-        # We can't update DB without admin client; try to mark failed if possible
         return
 
     try:
@@ -155,42 +155,32 @@ def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
         else:
             raise ValueError(f"Unsupported stroke type: {stroke_type}")
 
-        # Write result & set status completed
         supabase_admin.table("videos").update({
-            "analysis": result,           # change to "analysis_json" if your column is named that
+            "analysis": result,           # use "analysis_json" instead if that's your column
             "analysis_status": "completed",
             "error_message": None,
         }).eq("id", video_id).execute()
 
     except Exception as e:
-        # Mark as failed and store error string
         try:
             supabase_admin.table("videos").update({
                 "analysis_status": "failed",
-                "error_message": str(e),
+                "error_message": f"{type(e).__name__}: {str(e)}",
             }).eq("id", video_id).execute()
         except Exception:
             pass
 
 @app.post("/analyze-from-storage")
 async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
-    """
-    App flow:
-      1) Upload to Supabase Storage (bucket: videos)
-      2) Insert row in public.videos with analysis_status='pending'
-      3) Call POST /analyze-from-storage with { video_id, storage_path, stroke_type }
-    """
     if not supabase_admin:
         return JSONResponse(status_code=500, content={"error": "Supabase admin client not configured"})
 
     try:
-        # Flip to processing now
         supabase_admin.table("videos").update({
             "analysis_status": "processing",
             "error_message": None,
         }).eq("id", payload.video_id).execute()
 
-        # Start background analysis
         t = threading.Thread(
             target=do_analysis_and_update,
             args=(payload.video_id, payload.storage_path, payload.stroke_type),
@@ -200,71 +190,88 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
 
         return {"status": "accepted", "video_id": payload.video_id}
     except Exception as e:
-        # If even starting fails, mark failed
         try:
             supabase_admin.table("videos").update({
                 "analysis_status": "failed",
-                "error_message": str(e),
+                "error_message": f"{type(e).__name__}: {str(e)}",
             }).eq("id", payload.video_id).execute()
         except Exception:
             pass
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
-# ---------- Feature computation from keypoints (MVP test endpoint) ----------
+# -----------------------------------------------------------------------------
+# Feature computation from keypoints (high-value metrics)
+# -----------------------------------------------------------------------------
+class Keypoint(BaseModel):
+    x: float
+    y: float
+    confidence: Optional[float] = Field(default=None)
+
+# Each element: {"frame": 180, "phase": "contact"}
 class PhaseMark(BaseModel):
     frame: int
     phase: str
 
 class FeatureRequest(BaseModel):
-    """
-    Request body:
-    {
-      "fps": 30,
-      "stroke_type": "forehand",
-      "frames": [ { keypoint_name: { "x": <float>, "y": <float> }, ... }, ... ],
-      "phases": [ { "frame": 180, "phase": "contact" }, ... ]   # optional
-    }
-    """
-    fps: float = 30.0
-    stroke_type: str = "forehand"
-    frames: List[Dict[str, Dict[str, float]]]
-    phases: Optional[List[PhaseMark]] = None
+    fps: float = 30
+    stroke_type: Optional[str] = "forehand"   # forwarded in response; util does not need it
+    frames: List[Dict[str, Keypoint]]
+    phases: Optional[List[PhaseMark]] = None  # optional; pass [] if missing
 
 @app.post("/features/compute")
 def compute_features_endpoint(req: FeatureRequest):
     """
-    Accepts a list of frames where each frame is a dict of
-    keypoint_name -> {x, y}. Computes the features and returns them.
+    Accepts frames as:
+      {
+        "fps": 30,
+        "stroke_type": "forehand",
+        "phases": [{"frame": 180, "phase": "contact"}],
+        "frames": [
+          {"left_shoulder": {"x":..,"y":..}, "right_hip": {...}, ...},
+          ...
+        ]
+      }
+    Returns metrics from utils_features.compute_features_from_keypoints().
     """
     try:
-        # Convert incoming dicts into the shape utils_features expects:
-        # List[ Dict[str, Tuple[float,float]] ]
+        if not isinstance(req.fps, (int, float)) or req.fps <= 0:
+            return JSONResponse(status_code=400, content={"error": "fps must be a positive number"})
+        if not req.frames or not isinstance(req.frames, list):
+            return JSONResponse(status_code=400, content={"error": "frames must be a non-empty list"})
+
+        # Shape → List[ Dict[str, Tuple[x,y]] ]
         frames_xy: List[Dict[str, tuple]] = []
         for f in req.frames:
             frame_xy: Dict[str, tuple] = {}
             for name, kp in f.items():
-                x = kp.get("x")
-                y = kp.get("y")
-                if x is None or y is None:
+                if kp is None:
                     continue
-                frame_xy[name] = (float(x), float(y))
+                frame_xy[name] = (float(kp.x), float(kp.y))
             if frame_xy:
                 frames_xy.append(frame_xy)
 
         if not frames_xy:
             return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
 
-        # Prepare optional phases for the util
-        phases_list = [{"frame": p.frame, "phase": p.phase} for p in (req.phases or [])]
+        phases_list: List[Dict[str, object]] = []
+        if req.phases:
+            for p in req.phases:
+                if isinstance(p.frame, int) and isinstance(p.phase, str) and p.phase:
+                    phases_list.append({"frame": int(p.frame), "phase": p.phase})
 
-        # ✅ Your util requires (frames_xy, phases, fps)
-        feats = compute_features_from_keypoints(frames_xy, phases_list, req.fps)
+        # ✅ utils_features signature: (frames_xy, phases, fps)
+        features = compute_features_from_keypoints(frames_xy, phases_list, float(req.fps))
 
         return {
             "ok": True,
-            "fps": req.fps,
+            "fps": float(req.fps),
             "stroke_type": req.stroke_type,
-            "features": feats
+            "features": features,
         }
+
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        payload = {"error": f"{type(e).__name__}: {str(e)}"}
+        # Set DEBUG=1 in Render env to include trace
+        if os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"):
+            payload["trace"] = traceback.format_exc()
+        return JSONResponse(status_code=500, content=payload)
