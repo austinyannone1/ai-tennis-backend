@@ -4,7 +4,7 @@ import os
 import uuid
 import shutil
 import threading
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -211,18 +211,24 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ---------- Feature computation from keypoints (MVP test endpoint) ----------
+class PhaseMark(BaseModel):
+    frame: int
+    phase: str
+
 class FeatureRequest(BaseModel):
     """
     Request body:
     {
       "fps": 30,
       "stroke_type": "forehand",
-      "frames": [ { keypoint_name: { "x": <float>, "y": <float> }, ... }, ... ]
+      "frames": [ { keypoint_name: { "x": <float>, "y": <float> }, ... }, ... ],
+      "phases": [ { "frame": 180, "phase": "contact" }, ... ]   # optional
     }
     """
     fps: float = 30.0
     stroke_type: str = "forehand"
     frames: List[Dict[str, Dict[str, float]]]
+    phases: Optional[List[PhaseMark]] = None
 
 @app.post("/features/compute")
 def compute_features_endpoint(req: FeatureRequest):
@@ -248,10 +254,17 @@ def compute_features_endpoint(req: FeatureRequest):
         if not frames_xy:
             return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
 
-        # ✅ Call without stroke_type — your util doesn't accept it
-        feats = compute_features_from_keypoints(frames_xy, fps=req.fps)
+        # Prepare optional phases for the util
+        phases_list = [{"frame": p.frame, "phase": p.phase} for p in (req.phases or [])]
 
-        return {"ok": True, "fps": req.fps, "stroke_type": req.stroke_type, "features": feats}
+        # ✅ Your util requires (frames_xy, phases, fps)
+        feats = compute_features_from_keypoints(frames_xy, phases_list, req.fps)
+
+        return {
+            "ok": True,
+            "fps": req.fps,
+            "stroke_type": req.stroke_type,
+            "features": feats
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
