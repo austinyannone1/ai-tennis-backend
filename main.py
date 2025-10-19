@@ -6,7 +6,7 @@ import threading
 import traceback
 from typing import Dict, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Body, Response
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,12 +15,12 @@ from supabase import create_client, Client
 # --- import your util + (try) the joint index map ---
 from utils_features import compute_features_from_keypoints
 try:
-    # if utils_features exposes MP, use it
-    from utils_features import MP as MP_UTIL
+    # If your utils_features exposes a MediaPipe-like name->index map, use it.
+    from utils_features import MP as MP_UTIL  # type: ignore
 except Exception:
     MP_UTIL = None
 
-# Fallback joint index map (must match utils_features.py)
+# Fallback joint index map (must match your utils_features expectations)
 MP_FALLBACK: Dict[str, int] = {
     "left_shoulder": 11, "right_shoulder": 12,
     "left_elbow": 13,    "right_elbow": 14,
@@ -35,7 +35,7 @@ MP: Dict[str, int] = MP_UTIL or MP_FALLBACK
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten later to your app origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,7 +49,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------------------------------
-# Mock analyzers (placeholder)
+# Mock analyzers (placeholder — replace with your real pipeline)
 # -----------------------------------------------------------------------------
 def analyze_forehand(video_path_or_ref: str) -> dict:
     return {
@@ -99,7 +99,7 @@ def analyze_serve(video_path_or_ref: str) -> dict:
     }
 
 # -----------------------------------------------------------------------------
-# /analyze (direct upload)
+# /analyze (direct upload, synchronous)
 # -----------------------------------------------------------------------------
 @app.post("/analyze")
 async def analyze_video(
@@ -133,7 +133,7 @@ async def analyze_video(
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
 # -----------------------------------------------------------------------------
-# /analyze-from-storage (async save to Supabase)
+# /analyze-from-storage (async + save to Supabase)
 # -----------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -206,7 +206,7 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
 # -----------------------------------------------------------------------------
-# /features/compute (convert name→index to satisfy utils)
+# /features/compute (name→index mapping + call utils_features)
 # -----------------------------------------------------------------------------
 class Keypoint(BaseModel):
     x: float
@@ -231,7 +231,7 @@ def compute_features_endpoint(req: FeatureRequest):
         if req.fps <= 0:
             return JSONResponse(status_code=400, content={"error": "fps must be > 0"})
 
-        # First: name→(x,y)
+        # 1) Convert to name -> (x, y)
         frames_named: List[Dict[str, tuple]] = []
         for f in req.frames:
             d: Dict[str, tuple] = {}
@@ -245,7 +245,7 @@ def compute_features_endpoint(req: FeatureRequest):
         if not frames_named:
             return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
 
-        # Then convert name→index to satisfy utils_features (avoids KeyError: 11)
+        # 2) Map name -> index for your utils (avoids KeyError: 11 etc.)
         frames_indexed: List[Dict[int, tuple]] = []
         for d in frames_named:
             di: Dict[int, tuple] = {}
@@ -264,14 +264,14 @@ def compute_features_endpoint(req: FeatureRequest):
                 content={"error": "After mapping names to indices, no usable keypoints remained. Check your keypoint names."}
             )
 
-        # Phases → list of dicts
+        # 3) Normalize phases -> list of dicts that utils accepts
         phases_list: List[Dict[str, object]] = []
         if req.phases:
             for p in req.phases:
                 if isinstance(p.frame, int) and p.phase:
                     phases_list.append({"frame": int(p.frame), "phase": p.phase})
 
-        # Call util: (frames_xy, phases, fps)
+        # 4) Call your util. Signature: compute_features_from_keypoints(frames, phases, fps)
         features = compute_features_from_keypoints(frames_indexed, phases_list, float(req.fps))
 
         return {
@@ -287,19 +287,19 @@ def compute_features_endpoint(req: FeatureRequest):
             payload["trace"] = traceback.format_exc()
         return JSONResponse(status_code=500, content=payload)
 
-# --- ElevenLabs TTS proxy (safe server-side key) ---
-import base64
+# -----------------------------------------------------------------------------
+# ElevenLabs TTS proxy (keeps your API key server-side)
+# -----------------------------------------------------------------------------
 import httpx
-from fastapi import Body
 
-ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel (default)
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")       # Rachel (default)
 ELEVEN_MODEL_ID = os.environ.get("ELEVEN_MODEL_ID", "eleven_multilingual_v2")
 
 @app.post("/tts")
 async def tts_proxy(payload: dict = Body(...)):
     """
     Body: { "text": "Coach line to read", "voice_id": "optional-voice-id" }
-    Returns: audio/mpeg bytes
+    Returns: raw audio/mpeg bytes (so the app can play it directly)
     """
     api_key = os.environ.get("ELEVENLABS_API_KEY")
     if not api_key:
