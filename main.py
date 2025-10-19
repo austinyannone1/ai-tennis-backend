@@ -286,3 +286,46 @@ def compute_features_endpoint(req: FeatureRequest):
         if os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"):
             payload["trace"] = traceback.format_exc()
         return JSONResponse(status_code=500, content=payload)
+
+# --- ElevenLabs TTS proxy (safe server-side key) ---
+import base64
+import httpx
+from fastapi import Body
+
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel (default)
+ELEVEN_MODEL_ID = os.environ.get("ELEVEN_MODEL_ID", "eleven_multilingual_v2")
+
+@app.post("/tts")
+async def tts_proxy(payload: dict = Body(...)):
+    """
+    Body: { "text": "Coach line to read", "voice_id": "optional-voice-id" }
+    Returns: audio/mpeg bytes
+    """
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        return JSONResponse(status_code=500, content={"error": "ELEVENLABS_API_KEY not set"})
+
+    text = (payload.get("text") or "").strip()
+    voice_id = payload.get("voice_id") or ELEVEN_VOICE_ID
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "Missing text"})
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    body = {
+        "text": text,
+        "model_id": ELEVEN_MODEL_ID,
+        "voice_settings": { "stability": 0.45, "similarity_boost": 0.8 }
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(url, headers=headers, json=body)
+            if r.status_code != 200:
+                return JSONResponse(status_code=r.status_code, content={"error": r.text})
+            return Response(content=r.content, media_type="audio/mpeg")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
