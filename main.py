@@ -10,18 +10,29 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
 from supabase import create_client, Client
 
-# Your feature helper
+# --- import your util + (try) the joint index map ---
 from utils_features import compute_features_from_keypoints
+try:
+    # if utils_features exposes MP, use it
+    from utils_features import MP as MP_UTIL
+except Exception:
+    MP_UTIL = None
+
+# Fallback joint index map (must match utils_features.py)
+MP_FALLBACK: Dict[str, int] = {
+    "left_shoulder": 11, "right_shoulder": 12,
+    "left_elbow": 13,    "right_elbow": 14,
+    "left_wrist": 15,    "right_wrist": 16,
+    "left_hip": 23,      "right_hip": 24,
+}
+MP: Dict[str, int] = MP_UTIL or MP_FALLBACK
 
 # -----------------------------------------------------------------------------
 # App & CORS
 # -----------------------------------------------------------------------------
 app = FastAPI()
-
-# MVP: open CORS (tighten later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,7 +49,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------------------------------
-# Mock analyzers (placeholder — swap with real model)
+# Mock analyzers (placeholder)
 # -----------------------------------------------------------------------------
 def analyze_forehand(video_path_or_ref: str) -> dict:
     return {
@@ -88,7 +99,7 @@ def analyze_serve(video_path_or_ref: str) -> dict:
     }
 
 # -----------------------------------------------------------------------------
-# Existing /analyze (direct file upload — returns phases/feedback)
+# /analyze (direct upload)
 # -----------------------------------------------------------------------------
 @app.post("/analyze")
 async def analyze_video(
@@ -118,12 +129,11 @@ async def analyze_video(
         if "error" in result:
             return JSONResponse(status_code=400, content=result)
         return JSONResponse(content=result)
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
 # -----------------------------------------------------------------------------
-# New analyze-from-storage (async → updates Supabase row)
+# /analyze-from-storage (async save to Supabase)
 # -----------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
@@ -137,13 +147,12 @@ if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
 
 class AnalyzeFromStoragePayload(BaseModel):
     video_id: str
-    storage_path: str   # e.g. "<user-id>/<filename>.mp4"
-    stroke_type: str    # "forehand" | "backhand" | "serve"
+    storage_path: str
+    stroke_type: str
 
 def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
     if not supabase_admin:
         return
-
     try:
         st = (stroke_type or "").lower()
         if st == "forehand":
@@ -156,11 +165,10 @@ def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
             raise ValueError(f"Unsupported stroke type: {stroke_type}")
 
         supabase_admin.table("videos").update({
-            "analysis": result,           # use "analysis_json" instead if that's your column
+            "analysis": result,           # use "analysis_json" if that's your column
             "analysis_status": "completed",
             "error_message": None,
         }).eq("id", video_id).execute()
-
     except Exception as e:
         try:
             supabase_admin.table("videos").update({
@@ -174,7 +182,6 @@ def do_analysis_and_update(video_id: str, storage_path: str, stroke_type: str):
 async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
     if not supabase_admin:
         return JSONResponse(status_code=500, content={"error": "Supabase admin client not configured"})
-
     try:
         supabase_admin.table("videos").update({
             "analysis_status": "processing",
@@ -187,7 +194,6 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
             daemon=True,
         )
         t.start()
-
         return {"status": "accepted", "video_id": payload.video_id}
     except Exception as e:
         try:
@@ -200,67 +206,73 @@ async def analyze_from_storage(payload: AnalyzeFromStoragePayload):
         return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
 # -----------------------------------------------------------------------------
-# Feature computation from keypoints (high-value metrics)
+# /features/compute (convert name→index to satisfy utils)
 # -----------------------------------------------------------------------------
 class Keypoint(BaseModel):
     x: float
     y: float
     confidence: Optional[float] = Field(default=None)
 
-# Each element: {"frame": 180, "phase": "contact"}
 class PhaseMark(BaseModel):
     frame: int
     phase: str
 
 class FeatureRequest(BaseModel):
     fps: float = 30
-    stroke_type: Optional[str] = "forehand"   # forwarded in response; util does not need it
-    frames: List[Dict[str, Keypoint]]
-    phases: Optional[List[PhaseMark]] = None  # optional; pass [] if missing
+    stroke_type: Optional[str] = "forehand"
+    frames: List[Dict[str, Keypoint]]        # name-keyed points
+    phases: Optional[List[PhaseMark]] = None # optional
 
 @app.post("/features/compute")
 def compute_features_endpoint(req: FeatureRequest):
-    """
-    Accepts frames as:
-      {
-        "fps": 30,
-        "stroke_type": "forehand",
-        "phases": [{"frame": 180, "phase": "contact"}],
-        "frames": [
-          {"left_shoulder": {"x":..,"y":..}, "right_hip": {...}, ...},
-          ...
-        ]
-      }
-    Returns metrics from utils_features.compute_features_from_keypoints().
-    """
     try:
-        if not isinstance(req.fps, (int, float)) or req.fps <= 0:
-            return JSONResponse(status_code=400, content={"error": "fps must be a positive number"})
-        if not req.frames or not isinstance(req.frames, list):
+        if not req.frames:
             return JSONResponse(status_code=400, content={"error": "frames must be a non-empty list"})
+        if req.fps <= 0:
+            return JSONResponse(status_code=400, content={"error": "fps must be > 0"})
 
-        # Shape → List[ Dict[str, Tuple[x,y]] ]
-        frames_xy: List[Dict[str, tuple]] = []
+        # First: name→(x,y)
+        frames_named: List[Dict[str, tuple]] = []
         for f in req.frames:
-            frame_xy: Dict[str, tuple] = {}
+            d: Dict[str, tuple] = {}
             for name, kp in f.items():
                 if kp is None:
                     continue
-                frame_xy[name] = (float(kp.x), float(kp.y))
-            if frame_xy:
-                frames_xy.append(frame_xy)
+                d[name] = (float(kp.x), float(kp.y))
+            if d:
+                frames_named.append(d)
 
-        if not frames_xy:
+        if not frames_named:
             return JSONResponse(status_code=400, content={"error": "No valid frames with (x,y) provided"})
 
+        # Then convert name→index to satisfy utils_features (avoids KeyError: 11)
+        frames_indexed: List[Dict[int, tuple]] = []
+        for d in frames_named:
+            di: Dict[int, tuple] = {}
+            for name, xy in d.items():
+                idx = MP.get(name)
+                if idx is None:
+                    # silently skip unknown keypoints
+                    continue
+                di[idx] = xy
+            if di:
+                frames_indexed.append(di)
+
+        if not frames_indexed:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "After mapping names to indices, no usable keypoints remained. Check your keypoint names."}
+            )
+
+        # Phases → list of dicts
         phases_list: List[Dict[str, object]] = []
         if req.phases:
             for p in req.phases:
-                if isinstance(p.frame, int) and isinstance(p.phase, str) and p.phase:
+                if isinstance(p.frame, int) and p.phase:
                     phases_list.append({"frame": int(p.frame), "phase": p.phase})
 
-        # ✅ utils_features signature: (frames_xy, phases, fps)
-        features = compute_features_from_keypoints(frames_xy, phases_list, float(req.fps))
+        # Call util: (frames_xy, phases, fps)
+        features = compute_features_from_keypoints(frames_indexed, phases_list, float(req.fps))
 
         return {
             "ok": True,
@@ -271,7 +283,6 @@ def compute_features_endpoint(req: FeatureRequest):
 
     except Exception as e:
         payload = {"error": f"{type(e).__name__}: {str(e)}"}
-        # Set DEBUG=1 in Render env to include trace
         if os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"):
             payload["trace"] = traceback.format_exc()
         return JSONResponse(status_code=500, content=payload)
